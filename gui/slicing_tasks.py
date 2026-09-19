@@ -35,41 +35,41 @@ def parse_slicing_settings(
     hop_size_text: str,
     max_sil_kept_text: str,
 ) -> tuple[SlicingSettings | None, str]:
-    threshold, error = _parse_float(threshold_text, "Threshold")
+    threshold, error = _parse_float(threshold_text, "Threshold 阈值")
     if error:
         return None, error
 
-    min_length, error = _parse_int(min_length_text, "Minimum Length")
+    min_length, error = _parse_int(min_length_text, "Minimum Length 最小长度")
     if error:
         return None, error
 
-    min_interval, error = _parse_int(min_interval_text, "Minimum Interval")
+    min_interval, error = _parse_int(min_interval_text, "Minimum Interval 最小间距")
     if error:
         return None, error
 
-    hop_size, error = _parse_int(hop_size_text, "Hop Size")
+    hop_size, error = _parse_int(hop_size_text, "Hop Size 跳跃步长")
     if error:
         return None, error
 
-    max_sil_kept, error = _parse_int(max_sil_kept_text, "Maximum Silence Length")
+    max_sil_kept, error = _parse_int(max_sil_kept_text, "Maximum Silence Length 最大静音长度")
     if error:
         return None, error
 
     for field_name, value in (
-        ("Minimum Length", min_length),
-        ("Minimum Interval", min_interval),
-        ("Hop Size", hop_size),
-        ("Maximum Silence Length", max_sil_kept),
+        ("Minimum Length 最小长度", min_length),
+        ("Minimum Interval 最小间距", min_interval),
+        ("Hop Size 跳跃步长", hop_size),
+        ("Maximum Silence Length 最大静音长度", max_sil_kept),
     ):
         if value <= 0:
-            return None, f"{field_name} must be greater than 0."
+            return None, f"{field_name} 必须大于 0。"
 
     if min_length < min_interval:
-        return None, "Minimum Length must be greater than or equal to Minimum Interval."
+        return None, "Minimum Length 最小长度 必须大于或等于 Minimum Interval 最小间距。"
     if min_interval < hop_size:
-        return None, "Minimum Interval must be greater than or equal to Hop Size."
+        return None, "Minimum Interval 最小间距 必须大于或等于 Hop Size 跳跃步长。"
     if max_sil_kept < hop_size:
-        return None, "Maximum Silence Length must be greater than or equal to Hop Size."
+        return None, "Maximum Silence Length 最大静音长度 必须大于或等于 Hop Size 跳跃步长。"
 
     return SlicingSettings(
         threshold=threshold,
@@ -131,9 +131,6 @@ def analyze_slicing_task(
             hop_size=settings.hop_size,
             max_sil_kept=settings.max_sil_kept,
         )
-
-        if (total_samples + slicer.hop_size - 1) // slicer.hop_size <= slicer.min_length:
-            return [(0, total_samples)], sample_rate, channels
 
         rms_list = build_rms_list_from_file(source_file, slicer)
         ranges = slicer.slice_ranges_from_rms(rms_list, total_samples)
@@ -198,14 +195,14 @@ def _parse_float(value: str, field_name: str) -> tuple[float | None, str]:
     try:
         return float(value), ""
     except ValueError:
-        return None, f"{field_name} must be a number."
+        return None, f"{field_name} 必须是数字。"
 
 
 def _parse_int(value: str, field_name: str) -> tuple[int | None, str]:
     try:
         return int(value), ""
     except ValueError:
-        return None, f"{field_name} must be an integer."
+        return None, f"{field_name} 必须是整数。"
 
 
 def _consume_rms_frames(buffer: np.ndarray, slicer: Slicer) -> tuple[np.ndarray, np.ndarray]:

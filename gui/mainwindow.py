@@ -67,7 +67,7 @@ class MainWindow(QMainWindow):
 
     def _q_browse_output_dir(self):
         path = QFileDialog.getExistingDirectory(
-            self, "Browse Output Directory", ".")
+            self, "选择输出目录", ".")
         if path != "":
             self.ui.lineEditOutputDir.setText(QDir.toNativeSeparators(path))
 
@@ -77,7 +77,7 @@ class MainWindow(QMainWindow):
             return
 
         paths, _ = QFileDialog.getOpenFileNames(
-            self, 'Select Audio Files', ".", f'Audio ({self.formatAllFilter});;{self.formatIndividualFilter}')
+            self, '选择音频文件', ".", f'音频 ({self.formatAllFilter});;{self.formatIndividualFilter}')
         for path in paths:
             item = QListWidgetItem()
             item.setSizeHint(QSize(200, 24))
@@ -95,7 +95,7 @@ class MainWindow(QMainWindow):
 
     def _q_about(self):
         QMessageBox.information(
-            self, "About", "Audio Slicer v1.4.0\nCopyright 2020-2026 OpenVPI Team")
+            self, "关于", "音频切片机 v1.4.0\nCopyright 2020-2026 OpenVPI Team")
 
     def _q_start(self):
         if self.processing:
@@ -119,10 +119,10 @@ class MainWindow(QMainWindow):
 
         output_format = self.ui.buttonGroup.checkedButton().text()
         if output_format == "mp3":
-            ret = QMessageBox.warning(self, "Warning",
-                                      "MP3 is not recommended for saving vocals as it is lossy. "
-                                      "If you want to save disk space, consider using FLAC instead. "
-                                      "Do you want to continue?",
+            ret = QMessageBox.warning(self, "警告",
+                                      "不建议使用 MP3 保存人声，因为它是有损格式。\n"
+                                      "如果想节省磁盘空间，建议改用 FLAC。\n"
+                                      "是否继续？",
                                       QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
             if ret == QMessageBox.Cancel:
                 return
@@ -201,44 +201,44 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 QApplication.applicationName(),
-                f"Slicing complete!\nProcessed {processed_count} file(s).\nGenerated {total_outputs} output file(s).",
+                f"切片完成！\n共处理 {processed_count} 个文件。\n生成 {total_outputs} 个输出文件。",
             )
             return
 
         first_failure = next(result for result in results if not result.success)
         failure_name = QFileInfo(first_failure.source_path).fileName() or first_failure.source_path
         failure_message = (
-            f"Failed: {failure_name}\n{first_failure.error}"
+            f"失败：{failure_name}\n{first_failure.error}"
             if first_failure.error
-            else f"Failed: {failure_name}"
+            else f"失败：{failure_name}"
         )
 
         if success_count == 0:
             QMessageBox.critical(
                 self,
                 QApplication.applicationName(),
-                f"Slicing failed for all {processed_count} file(s).\n{failure_message}",
+                f"全部 {processed_count} 个文件切片失败。\n{failure_message}",
             )
             return
 
         QMessageBox.warning(
             self,
             QApplication.applicationName(),
-            "Slicing finished with errors.\n"
-            f"Succeeded: {success_count}\n"
-            f"Failed: {failed_count}\n"
-            f"Generated {total_outputs} output file(s).\n"
+            "切片完成，但有部分文件出错。\n"
+            f"成功：{success_count}\n"
+            f"失败：{failed_count}\n"
+            f"生成 {total_outputs} 个输出文件。\n"
             f"{failure_message}",
         )
 
     def warningProcessNotFinished(self):
         QMessageBox.warning(self, QApplication.applicationName(),
-                            "Please wait for slicing to complete!")
+                            "请等待切片完成！")
 
     def setProcessing(self, processing: bool):
         enabled = not processing
         self.ui.pushButtonStart.setText(
-            "Slicing..." if processing else "Start")
+            "切片中..." if processing else "开始")
         self.ui.pushButtonStart.setEnabled(enabled)
         self.ui.pushButtonAddFiles.setEnabled(enabled)
         self.ui.listWidgetTaskList.setEnabled(enabled)
