@@ -71,6 +71,26 @@ class Slicer:
     def _frame_to_sample(self, frame_index: int, total_samples: int) -> int:
         return min(total_samples, frame_index * self.hop_size)
 
+    def _compute_trim_bounds(self, rms_list, total_frames):
+        """计算前导/尾随静音修剪后的帧范围。
+        前后各最多保留 max_sil_kept 帧静音。
+        返回 (trim_start, trim_end)；若全是静音，返回 (0, total_frames)。
+        """
+        if total_frames == 0:
+            return 0, total_frames
+        is_silent = rms_list < self.threshold
+        non_silent_indices = np.where(~is_silent)[0]
+        if len(non_silent_indices) == 0:
+            # 全是静音，保持原样返回，避免生成空文件
+            return 0, total_frames
+        first_non_silent = int(non_silent_indices[0])
+        last_non_silent = int(non_silent_indices[-1])
+        trim_start = max(0, first_non_silent - self.max_sil_kept)
+        trim_end = min(total_frames, last_non_silent + 1 + self.max_sil_kept)
+        if trim_start >= trim_end:
+            return 0, total_frames
+        return trim_start, trim_end
+
     def slice_ranges(self, waveform):
         if len(waveform.shape) > 1:
             samples = waveform.mean(axis=0)
@@ -78,8 +98,6 @@ class Slicer:
         else:
             samples = waveform
             total_samples = waveform.shape[0]
-        if (samples.shape[0] + self.hop_size - 1) // self.hop_size <= self.min_length:
-            return [(0, total_samples)]
 
         rms_list = get_rms(
             y=samples,
@@ -93,78 +111,104 @@ class Slicer:
             return [(0, total_samples)]
 
         total_frames = rms_list.shape[0]
-        if total_frames <= self.min_length:
-            return [(0, total_samples)]
+        is_silent = rms_list < self.threshold
 
-        sil_tags = []
-        silence_start = None
-        clip_start = 0
-        for i, rms in enumerate(rms_list):
-            # Keep looping while frame is silent.
-            if rms < self.threshold:
-                # Record start of silent frames.
-                if silence_start is None:
-                    silence_start = i
-                continue
-            # Keep looping while frame is not silent and silence start has not been recorded.
-            if silence_start is None:
-                continue
-            # Clear recorded silence start if interval is not enough or clip is too short
-            is_leading_silence = silence_start == 0 and i > self.max_sil_kept
-            need_slice_middle = i - silence_start >= self.min_interval and i - clip_start >= self.min_length
-            if not is_leading_silence and not need_slice_middle:
-                silence_start = None
-                continue
-            # Need slicing. Record the range of silent frames to be removed.
-            if i - silence_start <= self.max_sil_kept:
-                pos = rms_list[silence_start: i + 1].argmin() + silence_start
-                if silence_start == 0:
-                    sil_tags.append((0, pos))
-                else:
-                    sil_tags.append((pos, pos))
-                clip_start = pos
-            elif i - silence_start <= self.max_sil_kept * 2:
-                pos = rms_list[i - self.max_sil_kept: silence_start + self.max_sil_kept + 1].argmin()
-                pos += i - self.max_sil_kept
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
-                    clip_start = pos_r
-                else:
-                    sil_tags.append((min(pos_l, pos), max(pos_r, pos)))
-                    clip_start = max(pos_r, pos)
+        # 1. 计算前导/尾随静音修剪边界
+        trim_start, trim_end = self._compute_trim_bounds(rms_list, total_frames)
+
+        # 2. 收集所有连续静音段
+        silence_segments = []
+        sil_start = None
+        for i in range(total_frames):
+            if is_silent[i]:
+                if sil_start is None:
+                    sil_start = i
             else:
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
-                else:
-                    sil_tags.append((pos_l, pos_r))
-                clip_start = pos_r
-            silence_start = None
-        # Deal with trailing silence.
-        if silence_start is not None and total_frames - silence_start >= self.min_interval:
-            silence_end = min(total_frames, silence_start + self.max_sil_kept)
-            pos = rms_list[silence_start: silence_end + 1].argmin() + silence_start
-            sil_tags.append((pos, total_frames + 1))
+                if sil_start is not None:
+                    silence_segments.append((sil_start, i - 1))
+                    sil_start = None
+        if sil_start is not None:
+            silence_segments.append((sil_start, total_frames - 1))
 
-        # Convert silent tags to sample ranges for the kept clips.
-        if len(sil_tags) == 0:
+        # 3. 若无法切割，返回修剪后的单段
+        if not silence_segments or total_frames <= self.min_length:
+            return [(self._frame_to_sample(trim_start, total_samples),
+                     self._frame_to_sample(trim_end, total_samples))]
+
+        # 4. 计算“往前搜索范围”：5秒对应的帧数（min_length 是目标时长对应的帧数）
+        five_sec_frames = self.min_length // 2
+
+        audio_start = trim_start
+        audio_end = trim_end
+        if audio_start >= audio_end:
             return [(0, total_samples)]
 
+        # 5. 逐个片段寻找切割点
+        cut_points = []
+        clip_start = audio_start
+
+        while clip_start < audio_end:
+            target = clip_start + self.min_length
+            if target >= audio_end:
+                break
+
+            # 优先往前找：在 [clip_start + 5s, target] 范围内找静音段
+            forward_start = clip_start + five_sec_frames
+            forward_end = target
+
+            best_cut = None
+            best_dist = None
+            for sil in silence_segments:
+                if sil[1] >= forward_start and sil[0] <= forward_end:
+                    overlap_start = max(sil[0], forward_start)
+                    overlap_end = min(sil[1], forward_end)
+                    sil_mid = (overlap_start + overlap_end) // 2
+                    dist = abs(sil_mid - target)
+                    if best_dist is None or dist < best_dist:
+                        best_cut = sil_mid
+                        best_dist = dist
+
+            if best_cut is not None:
+                cut_points.append(best_cut)
+                clip_start = best_cut
+            else:
+                # 往前找不到，往后找 target 之后的第一个静音段
+                found = False
+                for sil in silence_segments:
+                    if sil[0] > target:
+                        sil_mid = (sil[0] + sil[1]) // 2
+                        if sil_mid < audio_end:
+                            cut_points.append(sil_mid)
+                            clip_start = sil_mid
+                            found = True
+                        break
+                if not found:
+                    break
+
+        # 6. 若始终没有切割点，返回修剪后的单段
+        if not cut_points:
+            return [(self._frame_to_sample(trim_start, total_samples),
+                     self._frame_to_sample(trim_end, total_samples))]
+
+        # 7. 根据 cut_points 生成 ranges
         ranges = []
-        if sil_tags[0][0] > 0:
-            ranges.append((0, self._frame_to_sample(sil_tags[0][0], total_samples)))
-        for i in range(len(sil_tags) - 1):
-            ranges.append(
-                (
-                    self._frame_to_sample(sil_tags[i][1], total_samples),
-                    self._frame_to_sample(sil_tags[i + 1][0], total_samples),
-                )
-            )
-        if sil_tags[-1][1] < total_frames:
-            ranges.append((self._frame_to_sample(sil_tags[-1][1], total_samples), total_samples))
+        prev_frame = audio_start
+        for cp in cut_points:
+            if cp > prev_frame:
+                ranges.append((
+                    self._frame_to_sample(prev_frame, total_samples),
+                    self._frame_to_sample(cp, total_samples),
+                ))
+                prev_frame = cp
+        if prev_frame < audio_end:
+            ranges.append((
+                self._frame_to_sample(prev_frame, total_samples),
+                self._frame_to_sample(audio_end, total_samples),
+            ))
+
+        if not ranges:
+            return [(0, total_samples)]
+
         return ranges
 
     # @timeit
