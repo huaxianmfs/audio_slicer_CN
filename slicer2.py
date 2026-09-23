@@ -74,14 +74,12 @@ class Slicer:
     def _compute_trim_bounds(self, rms_list, total_frames):
         """计算前导/尾随静音修剪后的帧范围。
         前后各最多保留 max_sil_kept 帧静音。
-        返回 (trim_start, trim_end)；若全是静音，返回 (0, total_frames)。
         """
         if total_frames == 0:
             return 0, total_frames
         is_silent = rms_list < self.threshold
         non_silent_indices = np.where(~is_silent)[0]
         if len(non_silent_indices) == 0:
-            # 全是静音，保持原样返回，避免生成空文件
             return 0, total_frames
         first_non_silent = int(non_silent_indices[0])
         last_non_silent = int(non_silent_indices[-1])
@@ -90,6 +88,42 @@ class Slicer:
         if trim_start >= trim_end:
             return 0, total_frames
         return trim_start, trim_end
+
+    def _pick_cut_point_in_segment(self, seg_start, seg_end, search_start, search_end):
+        """在静音段 [seg_start, seg_end] 和搜索范围 [search_start, search_end] 的重叠区域内，
+        选一个切点，保证切点距离静音段两端各至少 max_sil_kept 帧（静音段够长时）。
+
+        返回帧索引；无有效切点时返回 None。
+        """
+        lo = max(seg_start, search_start)
+        hi = min(seg_end, search_end)
+        if lo > hi:
+            return None
+
+        seg_len = seg_end - seg_start + 1
+        if seg_len >= 2 * self.max_sil_kept + 1:
+            # 静音段足够长：理想切点区间是去掉两端 max_sil_kept 余量后的部分
+            ideal_lo = seg_start + self.max_sil_kept
+            ideal_hi = seg_end - self.max_sil_kept
+        else:
+            # 静音段太短，无法两端都留余量：只取静音段中点
+            mid = (seg_start + seg_end) // 2
+            ideal_lo = ideal_hi = mid
+
+        valid_lo = max(lo, ideal_lo)
+        valid_hi = min(hi, ideal_hi)
+
+        if valid_lo > valid_hi:
+            # 理想区间与搜索窗口无交集：
+            # 取离理想区间最近的那一端（而不再退回到整个交集中点，
+            # 避免切点落在静音段边缘、实际把语音音头也带进去）
+            if ideal_hi < lo:
+                return lo
+            if ideal_lo > hi:
+                return hi
+            return (lo + hi) // 2
+
+        return (valid_lo + valid_hi) // 2
 
     def slice_ranges(self, waveform):
         if len(waveform.shape) > 1:
@@ -117,7 +151,7 @@ class Slicer:
         trim_start, trim_end = self._compute_trim_bounds(rms_list, total_frames)
 
         # 2. 收集所有连续静音段
-        silence_segments = []
+        raw_segments = []
         sil_start = None
         for i in range(total_frames):
             if is_silent[i]:
@@ -125,18 +159,21 @@ class Slicer:
                     sil_start = i
             else:
                 if sil_start is not None:
-                    silence_segments.append((sil_start, i - 1))
+                    raw_segments.append((sil_start, i - 1))
                     sil_start = None
         if sil_start is not None:
-            silence_segments.append((sil_start, total_frames - 1))
+            raw_segments.append((sil_start, total_frames - 1))
 
-        # 3. 若无法切割，返回修剪后的单段
+        # 3. 只保留长度 >= min_interval 的静音段作为切割候选
+        silence_segments = [
+            seg for seg in raw_segments
+            if (seg[1] - seg[0] + 1) >= self.min_interval
+        ]
+
+        # 4. 若无法切割，返回修剪后的单段
         if not silence_segments or total_frames <= self.min_length:
             return [(self._frame_to_sample(trim_start, total_samples),
                      self._frame_to_sample(trim_end, total_samples))]
-
-        # 4. 计算“往前搜索范围”：5秒对应的帧数（min_length 是目标时长对应的帧数）
-        five_sec_frames = self.min_length // 2
 
         audio_start = trim_start
         audio_end = trim_end
@@ -144,53 +181,57 @@ class Slicer:
             return [(0, total_samples)]
 
         # 5. 逐个片段寻找切割点
+        #    搜索窗口修正为 [clip_start + min_length, clip_start + 2 * min_length]
+        #    —— 保证切出来的每个片段都不短于 min_length，且不至于过长。
         cut_points = []
         clip_start = audio_start
 
         while clip_start < audio_end:
-            target = clip_start + self.min_length
-            if target >= audio_end:
+            target_lo = clip_start + self.min_length
+            target_hi = clip_start + 2 * self.min_length
+            if target_lo >= audio_end:
                 break
-
-            # 优先往前找：在 [clip_start + 5s, target] 范围内找静音段
-            forward_start = clip_start + five_sec_frames
-            forward_end = target
+            forward_start = target_lo
+            forward_end = min(target_hi, audio_end)
 
             best_cut = None
             best_dist = None
-            for sil in silence_segments:
-                if sil[1] >= forward_start and sil[0] <= forward_end:
-                    overlap_start = max(sil[0], forward_start)
-                    overlap_end = min(sil[1], forward_end)
-                    sil_mid = (overlap_start + overlap_end) // 2
-                    dist = abs(sil_mid - target)
-                    if best_dist is None or dist < best_dist:
-                        best_cut = sil_mid
-                        best_dist = dist
+            for seg in silence_segments:
+                if seg[1] < forward_start or seg[0] > forward_end:
+                    continue
+                candidate = self._pick_cut_point_in_segment(
+                    seg[0], seg[1], forward_start, forward_end)
+                if candidate is None:
+                    continue
+                dist = abs(candidate - target_lo)
+                if best_dist is None or dist < best_dist:
+                    best_cut = candidate
+                    best_dist = dist
 
             if best_cut is not None:
                 cut_points.append(best_cut)
                 clip_start = best_cut
             else:
-                # 往前找不到，往后找 target 之后的第一个静音段
+                # 往前找不到，往后找 target_lo 之后的第一个有效静音段
                 found = False
-                for sil in silence_segments:
-                    if sil[0] > target:
-                        sil_mid = (sil[0] + sil[1]) // 2
-                        if sil_mid < audio_end:
-                            cut_points.append(sil_mid)
-                            clip_start = sil_mid
+                for seg in silence_segments:
+                    if seg[0] > target_lo:
+                        candidate = self._pick_cut_point_in_segment(
+                            seg[0], seg[1], seg[0], seg[1])
+                        if candidate is not None and candidate < audio_end:
+                            cut_points.append(candidate)
+                            clip_start = candidate
                             found = True
                         break
                 if not found:
                     break
 
-        # 6. 若始终没有切割点，返回修剪后的单段
+        # 6. 若无切割点，返回修剪后的单段
         if not cut_points:
             return [(self._frame_to_sample(trim_start, total_samples),
                      self._frame_to_sample(trim_end, total_samples))]
 
-        # 7. 根据 cut_points 生成 ranges
+        # 7. 生成 ranges
         ranges = []
         prev_frame = audio_start
         for cp in cut_points:
